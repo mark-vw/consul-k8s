@@ -360,9 +360,9 @@ func (r *EndpointsController) upsertHealthCheck(pod corev1.Pod, client *api.Clie
 
 func getServiceName(pod corev1.Pod, serviceEndpoints corev1.Endpoints) string {
 	serviceName := serviceEndpoints.Name
-	if serviceNameFromAnnotation, ok := pod.Annotations[annotationService]; ok && serviceNameFromAnnotation != "" {
-		serviceName = serviceNameFromAnnotation
-	}
+	//if serviceNameFromAnnotation, ok := pod.Annotations[annotationService]; ok && serviceNameFromAnnotation != "" {
+	//	serviceName = serviceNameFromAnnotation
+	//}
 	return serviceName
 }
 
@@ -395,6 +395,11 @@ func (r *EndpointsController) createServiceRegistrations(pod corev1.Pod, service
 			consulServicePort = int(port)
 		}
 	}
+	if serviceEndpoints.Name != pod.Annotations[annotationService] {
+		// This is a secondary svc.
+		consulServicePort = 9090 // todo
+	}
+
 
 	// We only want that annotation to be present when explicitly overriding the consul svc name
 	// Otherwise, the Consul service name should equal the Kubernetes Service name.
@@ -474,11 +479,16 @@ func (r *EndpointsController) createServiceRegistrations(pod corev1.Pod, service
 	}
 	proxyConfig.Upstreams = upstreams
 
+	proxyPort := 20000
+	if serviceEndpoints.Name != pod.Annotations[annotationService] {
+		// This is a secondary svc.
+		proxyPort = 20001
+	}
 	proxyService := &api.AgentServiceRegistration{
 		Kind:      api.ServiceKindConnectProxy,
 		ID:        proxyServiceID,
 		Name:      proxyServiceName,
-		Port:      20000,
+		Port:      proxyPort,
 		Address:   pod.Status.PodIP,
 		Meta:      meta,
 		Namespace: r.consulNamespace(pod.Namespace),
@@ -486,7 +496,7 @@ func (r *EndpointsController) createServiceRegistrations(pod corev1.Pod, service
 		Checks: api.AgentServiceChecks{
 			{
 				Name:                           "Proxy Public Listener",
-				TCP:                            fmt.Sprintf("%s:20000", pod.Status.PodIP),
+				TCP:                            fmt.Sprintf("%s:%d", pod.Status.PodIP, proxyPort),
 				Interval:                       "10s",
 				DeregisterCriticalServiceAfter: "10m",
 			},

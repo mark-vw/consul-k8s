@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/go-logr/logr"
@@ -217,21 +218,34 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("error getting namespace metadata for container: %s", err))
 	}
 
-	// Add the init container that registers the service and sets up the Envoy configuration.
-	initContainer, err := h.containerInit(*ns, pod)
-	if err != nil {
-		h.Log.Error(err, "error configuring injection init container", "request name", req.Name)
-		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("error configuring injection init container: %s", err))
+	// multi-svc
+	svcs := []string{""}
+	if svcNames, ok := pod.Annotations["consul.hashicorp.com/service-names"]; ok && strings.Contains(svcNames, ",") {
+		svcs = strings.Split(svcNames, ",")
 	}
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
 
-	// Add the Envoy sidecar.
-	envoySidecar, err := h.envoySidecar(*ns, pod)
-	if err != nil {
-		h.Log.Error(err, "error configuring injection sidecar container", "request name", req.Name)
-		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("error configuring injection sidecar container: %s", err))
+
+	for i, svc := range svcs {
+		if i == 0 {
+			svc = ""
+		}
+		// Add the init container that registers the service and sets up the Envoy configuration.
+		initContainer, err := h.containerInit(*ns, pod, svc)
+		if err != nil {
+			h.Log.Error(err, "error configuring injection init container", "request name", req.Name)
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("error configuring injection init container: %s", err))
+		}
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+
+		// Add the Envoy sidecar.
+		envoySidecar, err := h.envoySidecar(*ns, pod, svc)
+		if err != nil {
+			h.Log.Error(err, "error configuring injection sidecar container", "request name", req.Name)
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("error configuring injection sidecar container: %s", err))
+		}
+		pod.Spec.Containers = append(pod.Spec.Containers, envoySidecar)
 	}
-	pod.Spec.Containers = append(pod.Spec.Containers, envoySidecar)
+
 
 	// Now that the consul-sidecar no longer needs to re-register services periodically
 	// (that functionality lives in the endpoints-controller),

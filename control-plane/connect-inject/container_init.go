@@ -2,6 +2,7 @@ package connectinject
 
 import (
 	"bytes"
+	"fmt"
 	"strconv"
 	"strings"
 	"text/template"
@@ -66,6 +67,8 @@ type initContainerCommandData struct {
 	// TProxyExcludeUIDs is a list of additional user IDs to exclude from traffic redirection via
 	// the consul connect redirect-traffic command.
 	TProxyExcludeUIDs []string
+
+	SecondarySvc string
 }
 
 // initCopyContainer returns the init container spec for the copy container which places
@@ -100,7 +103,7 @@ func (h *Handler) initCopyContainer() corev1.Container {
 
 // containerInit returns the init container spec for registering the Consul
 // service, setting up the Envoy bootstrap, etc.
-func (h *Handler) containerInit(namespace corev1.Namespace, pod corev1.Pod) (corev1.Container, error) {
+func (h *Handler) containerInit(namespace corev1.Namespace, pod corev1.Pod, secondarySvcAcct string) (corev1.Container, error) {
 	// Check if tproxy is enabled on this pod.
 	tproxyEnabled, err := transparentProxyEnabled(namespace, pod, h.EnableTransparentProxy)
 	if err != nil {
@@ -119,11 +122,16 @@ func (h *Handler) containerInit(namespace corev1.Namespace, pod corev1.Pod) (cor
 		TProxyExcludeOutboundCIDRs: splitCommaSeparatedItemsFromAnnotation(annotationTProxyExcludeOutboundCIDRs, pod),
 		TProxyExcludeUIDs:          splitCommaSeparatedItemsFromAnnotation(annotationTProxyExcludeUIDs, pod),
 		EnvoyUID:                   envoyUserAndGroupID,
+		SecondarySvc: secondarySvcAcct,
 	}
 
 	if data.AuthMethod != "" {
 		data.ServiceAccountName = pod.Spec.ServiceAccountName
 		data.ServiceName = pod.Annotations[annotationService]
+		if secondarySvcAcct != "" {
+			data.ServiceAccountName = secondarySvcAcct
+			data.ServiceName = secondarySvcAcct
+		}
 	}
 
 	// This determines how to configure the consul connect envoy command: what
@@ -152,14 +160,21 @@ func (h *Handler) containerInit(namespace corev1.Namespace, pod corev1.Pod) (cor
 	}
 
 	if h.AuthMethod != "" {
-		// Extract the service account token's volume mount
-		saTokenVolumeMount, err := findServiceAccountVolumeMount(pod)
-		if err != nil {
-			return corev1.Container{}, err
+		if secondarySvcAcct == "" {
+			// Extract the service account token's volume mount
+			saTokenVolumeMount, err := findServiceAccountVolumeMount(pod)
+			if err != nil {
+				return corev1.Container{}, err
+			}
+			// Append to volume mounts
+			volMounts = append(volMounts, saTokenVolumeMount)
+		} else {
+			volMounts = append(volMounts, corev1.VolumeMount{
+				Name:             fmt.Sprintf("%s-sa", secondarySvcAcct),
+				ReadOnly:         true,
+				MountPath:        fmt.Sprintf("/consul/serviceaccounts/%s", secondarySvcAcct),
+			})
 		}
-
-		// Append to volume mounts
-		volMounts = append(volMounts, saTokenVolumeMount)
 	}
 
 	// Render the command
@@ -171,8 +186,12 @@ func (h *Handler) containerInit(namespace corev1.Namespace, pod corev1.Pod) (cor
 		return corev1.Container{}, err
 	}
 
+	initContainerName := InjectInitContainerName
+	if secondarySvcAcct != "" {
+		initContainerName = fmt.Sprintf("%s-%s", InjectInitContainerName, secondarySvcAcct)
+	}
 	container := corev1.Container{
-		Name:  InjectInitContainerName,
+		Name:  initContainerName,
 		Image: h.ImageConsulK8S,
 		Env: []corev1.EnvVar{
 			{
@@ -295,10 +314,15 @@ consul-k8s-control-plane connect-init -pod-name=${POD_NAME} -pod-namespace=${POD
   {{- if .ConsulNamespace }}
   -consul-service-namespace="{{ .ConsulNamespace }}" \
   {{- end }}
+  {{- if .SecondarySvc }}
+  -bearer-token-file=/consul/serviceaccounts/{{ .SecondarySvc }}/token \
+  -acl-token-sink=/consul/connect-inject/acl-token-{{ .SecondarySvc }} \
+  -proxy-id-file=/consul/connect-inject/proxyid-{{ .SecondarySvc }}
+  {{- end }}
 
 # Generate the envoy bootstrap code
 /consul/connect-inject/consul connect envoy \
-  -proxy-id="$(cat /consul/connect-inject/proxyid)" \
+  -proxy-id="$(cat {{ if .SecondarySvc }}/consul/connect-inject/proxyid-{{.SecondarySvc}}{{ else }}/consul/connect-inject/proxyid{{ end }})" \
   {{- if .PrometheusScrapePath }}
   -prometheus-scrape-path="{{ .PrometheusScrapePath }}" \
   {{- end }}
@@ -306,7 +330,7 @@ consul-k8s-control-plane connect-init -pod-name=${POD_NAME} -pod-namespace=${POD
   -prometheus-backend-port="{{ .PrometheusBackendPort }}" \
   {{- end }}
   {{- if .AuthMethod }}
-  -token-file="/consul/connect-inject/acl-token" \
+  -token-file="/consul/connect-inject/acl-token{{ if .SecondarySvc }}-{{ .SecondarySvc }}{{ end }}" \
   {{- end }}
   {{- if .ConsulPartition }}
   -partition="{{ .ConsulPartition }}" \
@@ -314,7 +338,11 @@ consul-k8s-control-plane connect-init -pod-name=${POD_NAME} -pod-namespace=${POD
   {{- if .ConsulNamespace }}
   -namespace="{{ .ConsulNamespace }}" \
   {{- end }}
-  -bootstrap > /consul/connect-inject/envoy-bootstrap.yaml
+  {{- if .SecondarySvc }}
+  -address=127.0.0.1:20001 \
+  -admin-bind=127.0.0.1:19001 \
+  {{- end }}
+  -bootstrap > {{ if .SecondarySvc }}/consul/connect-inject/envoy-bootstrap-{{.SecondarySvc}}.yaml{{ else }}/consul/connect-inject/envoy-bootstrap.yaml{{ end }}
 
 {{- if .EnableTransparentProxy }}
 {{- /* The newline below is intentional to allow extra space

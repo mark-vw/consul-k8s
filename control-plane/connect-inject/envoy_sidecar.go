@@ -10,19 +10,23 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-func (h *Handler) envoySidecar(namespace corev1.Namespace, pod corev1.Pod) (corev1.Container, error) {
+func (h *Handler) envoySidecar(namespace corev1.Namespace, pod corev1.Pod, secondarySvcName string) (corev1.Container, error) {
 	resources, err := h.envoySidecarResources(pod)
 	if err != nil {
 		return corev1.Container{}, err
 	}
 
-	cmd, err := h.getContainerSidecarCommand(pod)
+	cmd, err := h.getContainerSidecarCommand(pod, secondarySvcName)
 	if err != nil {
 		return corev1.Container{}, err
 	}
 
+	containerName := envoySidecarContainer
+	if secondarySvcName != "" {
+		containerName = fmt.Sprintf("%s-%s", envoySidecarContainer, secondarySvcName)
+	}
 	container := corev1.Container{
-		Name:  envoySidecarContainer,
+		Name:  containerName,
 		Image: h.ImageEnvoy,
 		Env: []corev1.EnvVar{
 			{
@@ -51,7 +55,7 @@ func (h *Handler) envoySidecar(namespace corev1.Namespace, pod corev1.Pod) (core
 	// skip setting the security context and let OpenShift set it for us.
 	// When transparent proxy is enabled, then Envoy needs to run as our specific user
 	// so that traffic redirection will work.
-	if tproxyEnabled || !h.EnableOpenShift {
+	if tproxyEnabled /*|| !h.EnableOpenShift */ {
 		if pod.Spec.SecurityContext != nil {
 			// User container and Envoy container cannot have the same UID.
 			if pod.Spec.SecurityContext.RunAsUser != nil && *pod.Spec.SecurityContext.RunAsUser == envoyUserAndGroupID {
@@ -63,7 +67,7 @@ func (h *Handler) envoySidecar(namespace corev1.Namespace, pod corev1.Pod) (core
 		for _, c := range pod.Spec.Containers {
 			// User container and Envoy container cannot have the same UID.
 			if c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil && *c.SecurityContext.RunAsUser == envoyUserAndGroupID {
-				return corev1.Container{}, fmt.Errorf("container %q has runAsUser set to the same uid %q as envoy which is not allowed", c.Name, envoyUserAndGroupID)
+				return corev1.Container{}, fmt.Errorf("container %q has runAsUser set to the same uid %d as envoy which is not allowed", c.Name, envoyUserAndGroupID)
 			}
 		}
 		container.SecurityContext = &corev1.SecurityContext{
@@ -76,10 +80,17 @@ func (h *Handler) envoySidecar(namespace corev1.Namespace, pod corev1.Pod) (core
 
 	return container, nil
 }
-func (h *Handler) getContainerSidecarCommand(pod corev1.Pod) ([]string, error) {
+func (h *Handler) getContainerSidecarCommand(pod corev1.Pod, secondarySvc string) ([]string, error) {
+	bootstrapFile := "/consul/connect-inject/envoy-bootstrap.yaml"
+	if secondarySvc != "" {
+		bootstrapFile = fmt.Sprintf("/consul/connect-inject/envoy-bootstrap-%s.yaml", secondarySvc)
+	}
 	cmd := []string{
 		"envoy",
-		"--config-path", "/consul/connect-inject/envoy-bootstrap.yaml",
+		"--config-path", bootstrapFile,
+	}
+	if secondarySvc != "" {
+		cmd = append(cmd, "--base-id", "1")
 	}
 
 	extraArgs, annotationSet := pod.Annotations[annotationEnvoyExtraArgs]
